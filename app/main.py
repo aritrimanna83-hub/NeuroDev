@@ -1,9 +1,26 @@
 from __future__ import annotations
 
-from fastapi import FastAPI, HTTPException
+import base64
+import logging
+from io import BytesIO
+from pathlib import Path
+
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.staticfiles import StaticFiles
 import psycopg
+from pypdf import PdfReader
+from groq import Groq
+from starlette.concurrency import run_in_threadpool
 
 from app.config import settings
+from app.auth import (
+    AuthenticationError,
+    EmailConfigurationError,
+    UnverifiedAccountError,
+    auth_service,
+    send_password_reset_email,
+    send_verification_email,
+)
 from app.memory import memory_service
 from app.models import (
     ChatRequest,
@@ -11,12 +28,40 @@ from app.models import (
     DecisionRequest,
     DecisionResponse,
     HealthResponse,
+    LoginRequest,
     MemoryRequest,
     MemoryResponse,
+    PasswordResetCompleteRequest,
+    PasswordResetRequest,
     ProjectCreateRequest,
     ProjectResponse,
+    ResendVerificationRequest,
+    SignUpRequest,
+    VerifyEmailRequest,
 )
 from app.workflow import neurodev_workflow
+
+
+logger = logging.getLogger(__name__)
+
+
+def _extract_pdf_text(pdf_data: bytes, filename: str) -> str:
+    try:
+        reader = PdfReader(BytesIO(pdf_data), strict=True)
+        if reader.is_encrypted:
+            raise ValueError(f"{filename} is password-protected.")
+        if len(reader.pages) > 100:
+            raise ValueError(f"{filename} exceeds the 100-page limit.")
+        text = "\n\n".join(page.extract_text() or "" for page in reader.pages)
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(f"{filename} could not be read as a PDF.") from exc
+
+    text = text.strip()
+    if not text:
+        raise ValueError(f"{filename} contains no extractable text.")
+    return text[:100_000]
 
 
 app = FastAPI(
@@ -24,6 +69,180 @@ app = FastAPI(
     version=settings.APP_VERSION,
     description="NeuroDev - AI-powered second brain for developers.",
 )
+
+app.mount(
+    "/ui",
+    StaticFiles(directory=Path(__file__).parent / "frontend" / "public", html=True),
+    name="frontend",
+)
+
+
+def require_account(request: Request) -> dict[str, str]:
+    account = auth_service.get_session_account(request.headers.get("x-neurodev-tab"))
+    if account is None:
+        raise HTTPException(status_code=401, detail="Please sign in to continue.")
+    return account
+
+
+def require_admin(
+    account: dict[str, str] = Depends(require_account),
+) -> dict[str, str]:
+    admin_emails = {
+        email.strip().casefold()
+        for email in settings.ADMIN_EMAILS.split(",")
+        if email.strip()
+    }
+    if account["email"].casefold() not in admin_emails:
+        raise HTTPException(status_code=403, detail="Administrator access is required.")
+    return account
+
+
+@app.get("/admin/status")
+def admin_status(
+    account: dict[str, str] = Depends(require_account),
+) -> dict[str, bool]:
+    admin_emails = {
+        email.strip().casefold()
+        for email in settings.ADMIN_EMAILS.split(",")
+        if email.strip()
+    }
+    return {"is_admin": account["email"].casefold() in admin_emails}
+
+
+@app.get("/admin/accounts")
+def admin_accounts(
+    _: dict[str, str] = Depends(require_admin),
+) -> dict[str, list[dict[str, str | None]]]:
+    return {"accounts": auth_service.list_accounts()}
+
+
+@app.post("/auth/signup", status_code=202)
+def sign_up(request: SignUpRequest) -> dict[str, str]:
+    try:
+        account, code = auth_service.create_account(
+            request.name,
+            request.email,
+            request.password,
+        )
+    except AuthenticationError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    try:
+        send_verification_email(account["email"], account["name"], code)
+    except EmailConfigurationError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Could not send an account verification email.")
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Your account is saved, but the verification email could not be "
+                "delivered. The app owner should check the SMTP host, port, sender "
+                "credentials, and Gmail App Password, then restart the server. "
+                "Use Resend verification code after setup."
+            ),
+        ) from exc
+    return {
+        "message": (
+            "Check your inbox for the six-digit verification code, then enter it here. "
+            f"The code expires in {settings.AUTH_VERIFICATION_MINUTES} minutes."
+        )
+    }
+
+
+@app.post("/auth/verify")
+def verify_email(request: VerifyEmailRequest) -> dict[str, str]:
+    try:
+        account = auth_service.verify_email(request.email, request.code)
+    except AuthenticationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"message": "Email verified. You can now sign in.", "email": account["email"]}
+
+
+@app.post("/auth/resend-verification", status_code=202)
+def resend_verification(request: ResendVerificationRequest) -> dict[str, str]:
+    code = auth_service.issue_verification(request.email)
+    if code:
+        try:
+            account = auth_service.get_unverified_account(request.email)
+            if account is None:
+                raise RuntimeError("The pending account was not found.")
+            send_verification_email(account["email"], account["name"], code)
+        except EmailConfigurationError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.exception("Could not resend an account verification email.")
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "The verification email could not be delivered. The app owner "
+                    "should configure or check the server's SMTP settings, then try again."
+                ),
+            ) from exc
+    return {
+        "message": "If that address has an unverified account, a new verification code has been emailed."
+    }
+
+
+@app.post("/auth/password-reset/request", status_code=202)
+def request_password_reset(request: PasswordResetRequest) -> dict[str, str]:
+    reset = auth_service.issue_password_reset(request.email)
+    if reset:
+        account, code = reset
+        try:
+            send_password_reset_email(account["email"], account["name"], code)
+        except EmailConfigurationError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.exception("Could not send a password reset email.")
+            raise HTTPException(
+                status_code=503,
+                detail="The password reset email could not be delivered. Check the server's SMTP settings and try again.",
+            ) from exc
+    return {
+        "message": (
+            "If a verified account exists for that address, a password reset code has been emailed."
+        )
+    }
+
+
+@app.post("/auth/password-reset/complete")
+def complete_password_reset(request: PasswordResetCompleteRequest) -> dict[str, str]:
+    try:
+        auth_service.reset_password(request.email, request.code, request.new_password)
+    except AuthenticationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "message": "Your password has been reset. Sign in with your new password."
+    }
+
+
+@app.post("/auth/login")
+def log_in(
+    request: LoginRequest,
+) -> dict[str, dict[str, str] | str]:
+    try:
+        account = auth_service.authenticate(request.email, request.password)
+    except UnverifiedAccountError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except AuthenticationError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+
+    tab_session, _ = auth_service.create_session(account["id"])
+    return {"account": account, "tab_session": tab_session}
+
+
+@app.get("/auth/me")
+def current_account(
+    account: dict[str, str] = Depends(require_account),
+) -> dict[str, dict[str, str]]:
+    return {"account": account}
+
+
+@app.post("/auth/logout")
+def log_out(request: Request) -> dict[str, str]:
+    auth_service.delete_session(request.headers.get("x-neurodev-tab"))
+    return {"message": "Signed out."}
 
 
 # -------------------------------------------------------------------
@@ -43,7 +262,10 @@ def health_check() -> HealthResponse:
 
     # PostgreSQL
     try:
-        with psycopg.connect(settings.POSTGRES_URL) as conn:
+        with psycopg.connect(
+            settings.POSTGRES_URL,
+            connect_timeout=settings.POSTGRES_CONNECT_TIMEOUT,
+        ) as conn:
             with conn.cursor() as cursor:
                 cursor.execute("SELECT 1")
         dependencies["postgresql"] = "connected"
@@ -62,7 +284,69 @@ def health_check() -> HealthResponse:
 # Chat
 # -------------------------------------------------------------------
 
-@app.post("/chat", response_model=ChatResponse)
+def _transcribe_audio(audio_data: bytes, content_type: str) -> str:
+    audio_formats = {
+        "audio/flac": "flac",
+        "audio/mp3": "mp3",
+        "audio/mp4": "mp4",
+        "audio/mpeg": "mpeg",
+        "audio/mpga": "mpga",
+        "audio/m4a": "m4a",
+        "audio/ogg": "ogg",
+        "audio/opus": "opus",
+        "audio/wav": "wav",
+        "audio/webm": "webm",
+    }
+    media_type = content_type.split(";", maxsplit=1)[0].strip().lower()
+    extension = audio_formats.get(media_type)
+    if extension is None:
+        raise ValueError(f"Unsupported audio format: {media_type}")
+
+    client = Groq(api_key=settings.GROQ_API_KEY)
+
+    result = client.audio.transcriptions.create(
+        file=(f"voice-input.{extension}", audio_data, media_type),
+        model="whisper-large-v3",
+        language="en",
+        prompt=(
+            "Transcribe the complete English recording verbatim. Preserve every "
+            "word in the speaker's question or request; do not summarize or answer it."
+        ),
+        response_format="json",
+        temperature=0,
+    )
+    return result.text.strip()
+
+
+@app.post("/transcribe", dependencies=[Depends(require_account)])
+async def transcribe(request: Request) -> dict[str, str]:
+    content_type = request.headers.get("content-type", "").split(";", maxsplit=1)[0].strip().lower()
+    if not content_type.startswith("audio/"):
+        raise HTTPException(status_code=415, detail="Upload an audio recording to transcribe.")
+
+    content_length = request.headers.get("content-length")
+    if content_length and content_length.isdigit() and int(content_length) > 25 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Audio recordings must be 25 MB or smaller.")
+
+    audio_data = await request.body()
+    if not audio_data:
+        raise HTTPException(status_code=400, detail="The audio recording is empty.")
+    if len(audio_data) > 25 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Audio recordings must be 25 MB or smaller.")
+
+    try:
+        text = await run_in_threadpool(_transcribe_audio, audio_data, content_type)
+    except Exception as exc:
+        logger.exception("Speech transcription failed.")
+        raise HTTPException(
+            status_code=502,
+            detail="Speech transcription failed. Check the Groq API configuration and try again.",
+        ) from exc
+
+    return {"text": text}
+
+
+@app.post("/chat", response_model=ChatResponse, dependencies=[Depends(require_account)])
 def chat(request: ChatRequest) -> ChatResponse:
     """
     Start a new NeuroDev conversation.
@@ -72,18 +356,30 @@ def chat(request: ChatRequest) -> ChatResponse:
     """
 
     try:
-        # Save the user's message in short-term memory.
+        initial_state = {
+            "question": request.question,
+            "session_id": request.session_id,
+            "project_id": request.project_id,
+            "images": [image.data_url for image in request.images],
+            "documents": [],
+        }
+        for pdf in request.pdfs:
+            initial_state["documents"].append(
+                {
+                    "name": pdf.name,
+                    "text": _extract_pdf_text(
+                        base64.b64decode(pdf.data_base64, validate=True),
+                        pdf.name,
+                    ),
+                }
+            )
+
+        # Save the user's message only after attached PDFs have been validated.
         memory_service.save_session_message(
             session_id=request.session_id,
             role="user",
             content=request.question,
         )
-
-        initial_state = {
-            "question": request.question,
-            "session_id": request.session_id,
-            "project_id": request.project_id,
-        }
 
         config = {
             "configurable": {
@@ -131,6 +427,8 @@ def chat(request: ChatRequest) -> ChatResponse:
             ),
         )
 
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(
             status_code=500,
@@ -142,7 +440,11 @@ def chat(request: ChatRequest) -> ChatResponse:
 # Decision resolution
 # -------------------------------------------------------------------
 
-@app.post("/decision", response_model=DecisionResponse)
+@app.post(
+    "/decision",
+    response_model=DecisionResponse,
+    dependencies=[Depends(require_account)],
+)
 def resolve_decision(
     request: DecisionRequest,
 ) -> DecisionResponse:
@@ -212,7 +514,7 @@ def resolve_decision(
 # Memory
 # -------------------------------------------------------------------
 
-@app.post("/memory", response_model=MemoryResponse)
+@app.post("/memory", response_model=MemoryResponse, dependencies=[Depends(require_account)])
 def save_memory(request: MemoryRequest) -> MemoryResponse:
     """
     Manually save a piece of long-term project memory.
@@ -247,7 +549,7 @@ def save_memory(request: MemoryRequest) -> MemoryResponse:
 # Project
 # -------------------------------------------------------------------
 
-@app.post("/projects", response_model=ProjectResponse)
+@app.post("/projects", response_model=ProjectResponse, dependencies=[Depends(require_account)])
 def create_project(
     request: ProjectCreateRequest,
 ) -> ProjectResponse:
@@ -256,24 +558,11 @@ def create_project(
     project_id = str(uuid.uuid4())
 
     try:
-        with psycopg.connect(settings.POSTGRES_URL) as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    """
-                    INSERT INTO projects (
-                        id,
-                        name,
-                        description
-                    )
-                    VALUES (%s, %s, %s)
-                    """,
-                    (
-                        project_id,
-                        request.name,
-                        request.description,
-                    ),
-                )
-            conn.commit()
+        memory_service.create_project(
+            project_id=project_id,
+            name=request.name,
+            description=request.description,
+        )
 
         return ProjectResponse(
             project_id=project_id,

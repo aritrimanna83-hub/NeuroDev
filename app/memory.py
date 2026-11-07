@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -10,6 +11,10 @@ import redis
 import replicate
 
 from app.config import settings
+from app.local_store import LocalStore
+
+
+logger = logging.getLogger(__name__)
 
 
 class MemoryService:
@@ -40,11 +45,48 @@ class MemoryService:
         # Layer 2 + 3: PostgreSQL / pgvector
         # --------------------------------------------------
         self.postgres_url = settings.POSTGRES_URL
+        self.local_store = LocalStore()
+        self.use_local_store = False
 
         # --------------------------------------------------
         # Embedding Model
         # --------------------------------------------------
         self.embedding_model = settings.EMBEDDING_MODEL
+
+    def _enable_local_storage(self, error: Exception) -> None:
+        if not self.use_local_store:
+            logger.warning(
+                "PostgreSQL is unavailable; using persistent local SQLite storage: %s",
+                error,
+            )
+        self.use_local_store = True
+
+    def create_project(
+        self,
+        project_id: str,
+        name: str,
+        description: str | None,
+    ) -> None:
+        if self.use_local_store:
+            self.local_store.create_project(project_id, name, description)
+            return
+        try:
+            with psycopg.connect(
+                self.postgres_url,
+                connect_timeout=settings.POSTGRES_CONNECT_TIMEOUT,
+            ) as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        INSERT INTO projects (id, name, description)
+                        VALUES (%s, %s, %s)
+                        """,
+                        (project_id, name, description),
+                    )
+                conn.commit()
+        except psycopg.OperationalError as exc:
+            self._enable_local_storage(exc)
+            self.local_store.create_project(project_id, name, description)
 
     # ======================================================
     # REDIS - SHORT TERM MEMORY
@@ -71,13 +113,17 @@ class MemoryService:
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
-        self.redis.rpush(key, json.dumps(message))
+        if self.use_local_store:
+            self.local_store.save_session_message(session_id, role, content)
+            return
+        try:
+            self.redis.rpush(key, json.dumps(message))
 
-        # Automatically expire inactive sessions.
-        self.redis.expire(
-            key,
-            settings.REDIS_TTL,
-        )
+            # Automatically expire inactive sessions.
+            self.redis.expire(key, settings.REDIS_TTL)
+        except redis.RedisError as exc:
+            logger.warning("Redis is unavailable; saving session message locally: %s", exc)
+            self.local_store.save_session_message(session_id, role, content)
 
     def get_session_messages(
         self,
@@ -90,11 +136,13 @@ class MemoryService:
 
         key = f"neurodev:session:{session_id}"
 
-        messages = self.redis.lrange(
-            key,
-            max(0, -limit),
-            -1,
-        )
+        if self.use_local_store:
+            return self.local_store.get_session_messages(session_id, limit)
+        try:
+            messages = self.redis.lrange(key, max(0, -limit), -1)
+        except redis.RedisError as exc:
+            logger.warning("Redis is unavailable; reading session history locally: %s", exc)
+            return self.local_store.get_session_messages(session_id, limit)
 
         return [
             json.loads(message)
@@ -109,9 +157,11 @@ class MemoryService:
         Delete temporary session memory.
         """
 
-        self.redis.delete(
-            f"neurodev:session:{session_id}"
-        )
+        try:
+            self.redis.delete(f"neurodev:session:{session_id}")
+        except redis.RedisError as exc:
+            logger.warning("Could not clear the Redis session; clearing local history: %s", exc)
+        self.local_store.clear_session(session_id)
 
     # ======================================================
     # EMBEDDINGS - BGE-M3 / REPLICATE
@@ -169,45 +219,57 @@ class MemoryService:
 
         metadata = metadata or {}
 
-        with psycopg.connect(self.postgres_url) as conn:
-            with conn.cursor() as cursor:
+        if self.use_local_store:
+            self.local_store.save_decision(
+                decision_id,
+                project_id,
+                decision,
+                reason,
+                source,
+                confidence,
+                json.dumps(metadata),
+            )
+            return decision_id
 
-                cursor.execute(
-                    """
-                    INSERT INTO decisions (
-                        id,
-                        project_id,
-                        decision,
-                        reason,
-                        source,
-                        confidence,
-                        metadata,
-                        created_at
-                    )
-                    VALUES (
-                        %s,
-                        %s,
-                        %s,
-                        %s,
-                        %s,
-                        %s,
-                        %s,
-                        %s
-                    )
-                    """,
-                    (
-                        decision_id,
-                        project_id,
-                        decision,
-                        reason,
-                        source,
-                        confidence,
-                        json.dumps(metadata),
-                        datetime.now(timezone.utc),
-                    ),
-                )
+        try:
+            with psycopg.connect(
+                self.postgres_url,
+                connect_timeout=settings.POSTGRES_CONNECT_TIMEOUT,
+            ) as conn:
+                with conn.cursor() as cursor:
 
-            conn.commit()
+                    cursor.execute(
+                        """
+                        INSERT INTO decisions (
+                            id, project_id, decision, reason, source, confidence,
+                            metadata, created_at
+                        )
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                        """,
+                        (
+                            decision_id,
+                            project_id,
+                            decision,
+                            reason,
+                            source,
+                            confidence,
+                            json.dumps(metadata),
+                            datetime.now(timezone.utc),
+                        ),
+                    )
+
+                conn.commit()
+        except psycopg.OperationalError as exc:
+            self._enable_local_storage(exc)
+            self.local_store.save_decision(
+                decision_id,
+                project_id,
+                decision,
+                reason,
+                source,
+                confidence,
+                json.dumps(metadata),
+            )
 
         return decision_id
 
@@ -220,32 +282,29 @@ class MemoryService:
         Retrieve structured decisions for a project.
         """
 
-        with psycopg.connect(self.postgres_url) as conn:
-            with conn.cursor() as cursor:
-
-                cursor.execute(
-                    """
-                    SELECT
-                        id,
-                        project_id,
-                        decision,
-                        reason,
-                        source,
-                        confidence,
-                        metadata,
-                        created_at
-                    FROM decisions
-                    WHERE project_id = %s
-                    ORDER BY created_at DESC
-                    LIMIT %s
-                    """,
-                    (
-                        project_id,
-                        limit,
-                    ),
-                )
-
-                rows = cursor.fetchall()
+        if self.use_local_store:
+            return self.local_store.get_project_decisions(project_id, limit)
+        try:
+            with psycopg.connect(
+                self.postgres_url,
+                connect_timeout=settings.POSTGRES_CONNECT_TIMEOUT,
+            ) as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        SELECT id, project_id, decision, reason, source,
+                               confidence, metadata, created_at
+                        FROM decisions
+                        WHERE project_id = %s
+                        ORDER BY created_at DESC
+                        LIMIT %s
+                        """,
+                        (project_id, limit),
+                    )
+                    rows = cursor.fetchall()
+        except psycopg.OperationalError as exc:
+            self._enable_local_storage(exc)
+            return self.local_store.get_project_decisions(project_id, limit)
 
         return [
             {
@@ -278,47 +337,45 @@ class MemoryService:
         """
 
         memory_id = str(uuid.uuid4())
-
-        embedding = self.generate_embedding(content)
-
         metadata = metadata or {}
 
-        with psycopg.connect(self.postgres_url) as conn:
-            with conn.cursor() as cursor:
+        if self.use_local_store:
+            self.local_store.save_memory(
+                memory_id, project_id, content, memory_type, json.dumps(metadata)
+            )
+            return memory_id
 
-                cursor.execute(
-                    """
-                    INSERT INTO memories (
-                        id,
-                        project_id,
-                        content,
-                        memory_type,
-                        embedding,
-                        metadata,
-                        created_at
+        embedding = self.generate_embedding(content)
+        try:
+            with psycopg.connect(
+                self.postgres_url,
+                connect_timeout=settings.POSTGRES_CONNECT_TIMEOUT,
+            ) as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        INSERT INTO memories (
+                            id, project_id, content, memory_type, embedding,
+                            metadata, created_at
+                        )
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        """,
+                        (
+                            memory_id,
+                            project_id,
+                            content,
+                            memory_type,
+                            embedding,
+                            json.dumps(metadata),
+                            datetime.now(timezone.utc),
+                        ),
                     )
-                    VALUES (
-                        %s,
-                        %s,
-                        %s,
-                        %s,
-                        %s,
-                        %s,
-                        %s
-                    )
-                    """,
-                    (
-                        memory_id,
-                        project_id,
-                        content,
-                        memory_type,
-                        embedding,
-                        json.dumps(metadata),
-                        datetime.now(timezone.utc),
-                    ),
-                )
-
-            conn.commit()
+                conn.commit()
+        except psycopg.OperationalError as exc:
+            self._enable_local_storage(exc)
+            self.local_store.save_memory(
+                memory_id, project_id, content, memory_type, json.dumps(metadata)
+            )
 
         return memory_id
 
@@ -332,36 +389,32 @@ class MemoryService:
         Perform semantic similarity search using pgvector.
         """
 
+        if self.use_local_store:
+            return self.local_store.search_memories(project_id, query, limit)
+
         query_embedding = self.generate_embedding(query)
 
-        with psycopg.connect(self.postgres_url) as conn:
-            with conn.cursor() as cursor:
-
-                cursor.execute(
-                    """
-                    SELECT
-                        id,
-                        content,
-                        memory_type,
-                        metadata,
-                        created_at,
-                        1 - (
-                            embedding <=> %s::vector
-                        ) AS similarity
-                    FROM memories
-                    WHERE project_id = %s
-                    ORDER BY embedding <=> %s::vector
-                    LIMIT %s
-                    """,
-                    (
-                        query_embedding,
-                        project_id,
-                        query_embedding,
-                        limit,
-                    ),
-                )
-
-                rows = cursor.fetchall()
+        try:
+            with psycopg.connect(
+                self.postgres_url,
+                connect_timeout=settings.POSTGRES_CONNECT_TIMEOUT,
+            ) as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        SELECT id, content, memory_type, metadata, created_at,
+                               1 - (embedding <=> %s::vector) AS similarity
+                        FROM memories
+                        WHERE project_id = %s
+                        ORDER BY embedding <=> %s::vector
+                        LIMIT %s
+                        """,
+                        (query_embedding, project_id, query_embedding, limit),
+                    )
+                    rows = cursor.fetchall()
+        except psycopg.OperationalError as exc:
+            self._enable_local_storage(exc)
+            return self.local_store.search_memories(project_id, query, limit)
 
         return [
             {

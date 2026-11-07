@@ -4,9 +4,11 @@ uvicorn[standard]
 langgraph
 langchain-core
 langchain-groq
+groq
 
 pydantic
 pydantic-settings
+pypdf
 
 redis
 psycopg[binary]

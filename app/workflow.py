@@ -8,7 +8,6 @@ from app.agents import (
     decision_agent,
     decision_extraction_agent,
     memory_agent,
-    planner_agent,
     reasoning_agent,
     response_agent,
     retrieval_agent,
@@ -110,11 +109,6 @@ def build_workflow():
     # --------------------------------------------------------
 
     graph.add_node(
-        "planner",
-        planner_agent,
-    )
-
-    graph.add_node(
         "retrieval",
         retrieval_agent,
     )
@@ -158,15 +152,7 @@ def build_workflow():
     # Initial Flow
     # --------------------------------------------------------
 
-    graph.add_edge(
-        START,
-        "planner",
-    )
-
-    graph.add_edge(
-        "planner",
-        "retrieval",
-    )
+    graph.add_edge(START, "retrieval")
 
     graph.add_edge(
         "retrieval",

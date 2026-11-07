@@ -5,6 +5,7 @@ from typing import Any
 
 from langchain_core.messages import HumanMessage
 from langchain_groq import ChatGroq
+from groq import Groq
 
 from app.config import settings
 from app.memory import memory_service
@@ -19,6 +20,12 @@ from app.state import NeuroDevState
 llm = ChatGroq(
     api_key=settings.GROQ_API_KEY,
     model=settings.GROQ_MODEL,
+    temperature=settings.GROQ_TEMPERATURE,
+)
+
+response_llm = ChatGroq(
+    api_key=settings.GROQ_API_KEY,
+    model=settings.GROQ_RESPONSE_MODEL,
     temperature=settings.GROQ_TEMPERATURE,
 )
 
@@ -494,29 +501,58 @@ def response_agent(
         }
 
     prompt = f"""
-You are NeuroDev, an AI second brain for developers.
-
-Answer the developer using the project context below.
+You are NeuroDev, a helpful general-purpose AI assistant and an expert
+development partner. Answer the developer's actual question directly, whether
+it is about programming, general knowledge, writing, science, or another topic.
 
 Developer:
 {state["question"]}
 
 Project context:
-{state.get("context", "No relevant historical context found.")}
+{state.get("context") or "No relevant project context was found."}
+
+Attached PDF documents:
+{chr(10).join(f'--- {document["name"]} ---{chr(10)}{document["text"]}' for document in state.get("documents", [])) or "No PDFs attached."}
 
 Important:
-- Ground your response in the retrieved project context.
-- If historical decisions exist, respect their reasoning.
-- Do not invent project history.
-- If there is insufficient context, clearly say so.
-- Be concise and useful to a developer.
+- Use project context only when it is relevant to the question; it is optional
+  background, not the limit of what you know.
+- For general-knowledge questions, answer from your knowledge even when the
+  project context is empty or unrelated.
+- If historical project decisions are relevant, respect their reasoning. Do
+  not invent project-specific history or claim that a general fact came from
+  project context.
+- Answer naturally, clearly, and helpfully. Explain enough to be useful and
+  adapt the detail to the question.
+- Be honest about uncertainty. For facts that may have changed recently and
+  cannot be verified, state that limitation instead of guessing or refusing
+  solely because the answer is absent from project context.
 """
 
-    response = llm.invoke([
-        HumanMessage(content=prompt)
-    ])
+    images = state.get("images", [])
+    if images:
+        content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+        content.extend(
+            {
+                "type": "image_url",
+                "image_url": {"url": image},
+            }
+            for image in images
+        )
+        response = Groq(api_key=settings.GROQ_API_KEY).chat.completions.create(
+            model=settings.GROQ_VISION_MODEL,
+            messages=[{"role": "user", "content": content}],
+            temperature=settings.GROQ_TEMPERATURE,
+            max_completion_tokens=1024,
+        ).choices[0].message.content
+        if not response:
+            raise RuntimeError("The vision model returned an empty response.")
+    else:
+        response = response_llm.invoke([
+            HumanMessage(content=prompt)
+        ]).content
 
     return {
-        "final_response": response.content,
+        "final_response": response,
         "current_agent": "response",
     }

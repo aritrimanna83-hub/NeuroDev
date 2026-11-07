@@ -8,6 +8,8 @@ class NeuroDevState(TypedDict, total=False):
     question: str
     session_id: str
     project_id: str
+    images: list[str]
+    documents: list[dict[str, str]]
 
     # --------------------------------------------------
     # Planning
